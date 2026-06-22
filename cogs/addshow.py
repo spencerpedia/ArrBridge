@@ -353,9 +353,9 @@ class AddShow(commands.Cog):
         view = ShowPicker(self.client, results, interaction.user.id)
         await interaction.followup.send(f"Found {len(results)} result(s) for **{query}**:", view=view)
 
-    @app_commands.command(name="status", description="Check the download/library status of a show already in Sonarr.")
+    @app_commands.command(name="tvstatus", description="Check the download/library status of a show already in Sonarr.")
     @app_commands.describe(query="Show title to check")
-    async def status(self, interaction: discord.Interaction, query: str):
+    async def tvstatus(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer(thinking=True)
 
         async with aiohttp.ClientSession() as session:

@@ -9,13 +9,13 @@ via slash commands.
 dropdown, then pick a root folder and quality profile, then adds it and triggers a
 search for missing episodes. The reply keeps updating live with download progress.
 
-`/status query:<title>` — looks up a show already in your Sonarr library and shows
+`/tvstatus query:<title>` — looks up a show already in your Sonarr library and shows
 its current monitored/download status, without needing to add it or open Sonarr.
 
 `/addmovie query:<title>` — same flow as `/addshow`, but searches Radarr and adds a
 movie.
 
-`/moviestatus query:<title>` — same as `/status`, but for a movie already in Radarr.
+`/moviestatus query:<title>` — same as `/tvstatus`, but for a movie already in Radarr.
 
 Separately, a background task sweeps the channel set by `CLEANUP_CHANNEL_ID` every
 30 minutes and deletes every message older than `CLEANUP_MAX_AGE_HOURS` (default 6),
