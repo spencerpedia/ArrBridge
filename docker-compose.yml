@@ -6,3 +6,6 @@ services:
     container_name: arrbridge
     env_file: .env
     restart: unless-stopped
+    labels:
+      net.unraid.docker.icon: "/plugins/dockerMan/images/arrbridge.png"
+      net.unraid.docker.managed: "dockerman"
