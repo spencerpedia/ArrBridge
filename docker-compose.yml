@@ -1,0 +1,6 @@
+services:
+  sonarrbot:
+    build: .
+    container_name: sonarrbot
+    env_file: .env
+    restart: unless-stopped
