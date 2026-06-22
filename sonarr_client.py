@@ -40,3 +40,26 @@ class SonarrClient:
 
     async def add_series(self, session: aiohttp.ClientSession, series: dict):
         return await self._post(session, "/api/v3/series", series)
+
+    async def trigger_series_search(self, session: aiohttp.ClientSession, series_id: int):
+        return await self._post(session, "/api/v3/command", {"name": "SeriesSearch", "seriesId": series_id})
+
+    async def get_command(self, session: aiohttp.ClientSession, command_id: int):
+        return await self._get(session, f"/api/v3/command/{command_id}")
+
+    async def get_queue(self, session: aiohttp.ClientSession, series_id: int):
+        records = []
+        page = 1
+        while True:
+            data = await self._get(
+                session, "/api/v3/queue",
+                seriesIds=str(series_id), includeEpisode="true",
+                page=str(page), pageSize="200",
+            )
+            records.extend(data.get("records", []))
+            if len(records) >= data.get("totalRecords", len(records)):
+                return records
+            page += 1
+
+    async def get_episodes(self, session: aiohttp.ClientSession, series_id: int):
+        return await self._get(session, "/api/v3/episode", seriesId=str(series_id))

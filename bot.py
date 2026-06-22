@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("sonarrbot")
+log = logging.getLogger("arrbridge")
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.environ.get("GUILD_ID")
@@ -16,9 +16,11 @@ GUILD_ID = os.environ.get("GUILD_ID")
 intents = discord.Intents.default()
 
 
-class SonarrBot(commands.Bot):
+class ArrBridgeBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.addshow")
+        await self.load_extension("cogs.addmovie")
+        await self.load_extension("cogs.cleanup")
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -27,7 +29,7 @@ class SonarrBot(commands.Bot):
             await self.tree.sync()
 
 
-bot = SonarrBot(command_prefix="!", intents=intents)
+bot = ArrBridgeBot(command_prefix="!", intents=intents)
 
 
 @bot.event

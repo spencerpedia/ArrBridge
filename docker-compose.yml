@@ -1,6 +1,8 @@
+name: arrbridge
+
 services:
-  sonarrbot:
+  arrbridge:
     build: .
-    container_name: sonarrbot
+    container_name: arrbridge
     env_file: .env
     restart: unless-stopped
