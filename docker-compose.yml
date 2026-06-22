@@ -2,7 +2,7 @@ name: arrbridge
 
 services:
   arrbridge:
-    build: .
+    image: ghcr.io/spencerpedia/arrbridge:latest
     container_name: arrbridge
     env_file: .env
     restart: unless-stopped
