@@ -1,3 +1,5 @@
+![ArrBridge](Logos/banner.png)
+
 # ArrBridge
 
 Discord bot that lets you search for and add TV shows to Sonarr, and movies to Radarr,
