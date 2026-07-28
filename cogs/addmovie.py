@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 import aiohttp
@@ -10,6 +11,8 @@ from discord.ext import commands
 
 from radarr_client import RadarrClient, RadarrError
 
+log = logging.getLogger("arrbridge")
+
 RADARR_URL = os.environ["RADARR_URL"]
 RADARR_API_KEY = os.environ["RADARR_API_KEY"]
 
@@ -17,6 +20,11 @@ MAX_RESULTS = 25
 POLL_INTERVAL_SECONDS = 15
 SEARCH_TIMEOUT_SECONDS = 5 * 60
 DOWNLOAD_TIMEOUT_SECONDS = 45 * 60
+
+FINISHED_COMMAND_STATUSES = ("completed", "failed", "aborted", "cancelled")
+UNSUCCESSFUL_COMMAND_STATUSES = ("failed", "aborted", "cancelled")
+# Radarr forgets command IDs when it restarts, so polling one can fail forever.
+MAX_CONSECUTIVE_FAILURES = 20
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -60,7 +68,12 @@ async def _safe_edit(message: discord.Message, embed: discord.Embed):
     try:
         await message.edit(embed=embed)
     except discord.HTTPException:
-        pass
+        log.warning("Could not update status message %s", message.id, exc_info=True)
+
+
+async def _set_status(message: discord.Message, embed: discord.Embed, text: str):
+    embed.set_footer(text=text)
+    await _safe_edit(message, embed)
 
 
 def _queue_progress_text(queue: list[dict]) -> str:
@@ -83,47 +96,73 @@ async def get_movie_status_text(client: RadarrClient, session: aiohttp.ClientSes
     return f"{monitored} - downloaded" if movie.get("hasFile") else f"{monitored} - not downloaded yet"
 
 
+async def _await_search_command(client: RadarrClient, session: aiohttp.ClientSession, command_id: int) -> str | None:
+    """Poll a Radarr command until it finishes.
+
+    Returns the final status, or None if it could not be determined within the
+    timeout. Every exit path is bounded by the deadline - a command we can no
+    longer read is not worth polling forever, and the download it kicked off is
+    still worth tracking in the queue.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SEARCH_TIMEOUT_SECONDS
+    failures = 0
+
+    while loop.time() < deadline:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        try:
+            command = await client.get_command(session, command_id)
+        except RadarrError:
+            failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                log.warning("Gave up polling Radarr command %s after %d failures", command_id, failures)
+                return None
+            continue
+
+        failures = 0
+        status = command.get("status")
+        if status in FINISHED_COMMAND_STATUSES:
+            return status
+
+    log.warning("Radarr command %s did not finish within %ds", command_id, SEARCH_TIMEOUT_SECONDS)
+    return None
+
+
 async def track_download(client: RadarrClient, message: discord.Message, movie: dict, embed: discord.Embed):
     movie_id = movie["id"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async with aiohttp.ClientSession() as session:
         try:
             command = await client.trigger_movie_search(session, movie_id)
         except RadarrError:
-            embed.set_footer(text="Failed to start search - try searching from Radarr directly")
-            await _safe_edit(message, embed)
+            log.exception("Could not start a Radarr search for movie %s", movie_id)
+            await _set_status(message, embed, "Failed to start search - try searching from Radarr directly")
             return
 
-        command_id = command["id"]
-        deadline = loop.time() + SEARCH_TIMEOUT_SECONDS
-        while True:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            try:
-                command = await client.get_command(session, command_id)
-            except RadarrError:
-                continue
-            if command.get("status") in ("completed", "failed", "aborted", "cancelled"):
-                break
-            if loop.time() >= deadline:
-                embed.set_footer(text="Search is taking a while - check Radarr for status")
-                await _safe_edit(message, embed)
-                return
-
-        if command.get("status") != "completed":
-            embed.set_footer(text="Search did not complete - check Radarr for details")
-            await _safe_edit(message, embed)
+        status = await _await_search_command(client, session, command["id"])
+        if status in UNSUCCESSFUL_COMMAND_STATUSES:
+            await _set_status(message, embed, "Search did not complete - check Radarr for details")
             return
 
         deadline = loop.time() + DOWNLOAD_TIMEOUT_SECONDS
         last_status = None
         ever_queued = False
+        failures = 0
+
         while loop.time() < deadline:
             try:
                 queue = await client.get_queue(session, movie_id)
             except RadarrError:
-                queue = []
+                failures += 1
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    log.warning("Lost contact with Radarr while tracking movie %s", movie_id)
+                    await _set_status(message, embed, "Lost contact with Radarr - check Radarr for status")
+                    return
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
+            failures = 0
             if queue:
                 ever_queued = True
                 status_text = _queue_progress_text(queue)
@@ -133,8 +172,7 @@ async def track_download(client: RadarrClient, message: discord.Message, movie: 
                 except RadarrError:
                     refreshed = None
                 if refreshed and refreshed.get("hasFile"):
-                    embed.set_footer(text="Download completed")
-                    await _safe_edit(message, embed)
+                    await _set_status(message, embed, "Download completed")
                     return
                 status_text = (
                     "Waiting for a release to be grabbed..." if not ever_queued
@@ -142,17 +180,16 @@ async def track_download(client: RadarrClient, message: discord.Message, movie: 
                 )
 
             if status_text != last_status:
-                embed.set_footer(text=status_text)
-                await _safe_edit(message, embed)
+                await _set_status(message, embed, status_text)
                 last_status = status_text
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-        embed.set_footer(
-            text="Still downloading - check Radarr for live status" if ever_queued
-            else "No release grabbed within the timeout - check Radarr for status"
+        await _set_status(
+            message, embed,
+            "Still downloading - check Radarr for live status" if ever_queued
+            else "No release grabbed within the timeout - check Radarr for status",
         )
-        await _safe_edit(message, embed)
 
 
 class AddMovieOptionsView(discord.ui.View):

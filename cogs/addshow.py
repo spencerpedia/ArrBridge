@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 import aiohttp
@@ -10,6 +11,8 @@ from discord.ext import commands
 
 from sonarr_client import SonarrClient, SonarrError
 
+log = logging.getLogger("arrbridge")
+
 SONARR_URL = os.environ["SONARR_URL"]
 SONARR_API_KEY = os.environ["SONARR_API_KEY"]
 
@@ -17,6 +20,11 @@ MAX_RESULTS = 25
 POLL_INTERVAL_SECONDS = 15
 SEARCH_TIMEOUT_SECONDS = 5 * 60
 DOWNLOAD_TIMEOUT_SECONDS = 45 * 60
+
+FINISHED_COMMAND_STATUSES = ("completed", "failed", "aborted", "cancelled")
+UNSUCCESSFUL_COMMAND_STATUSES = ("failed", "aborted", "cancelled")
+# Sonarr forgets command IDs when it restarts, so polling one can fail forever.
+MAX_CONSECUTIVE_FAILURES = 20
 
 # asyncio.create_task() doesn't keep a strong reference to the task, so without
 # this it can be garbage-collected mid-flight.
@@ -57,7 +65,23 @@ async def _safe_edit(message: discord.Message, embed: discord.Embed):
     try:
         await message.edit(embed=embed)
     except discord.HTTPException:
-        pass
+        log.warning("Could not update status message %s", message.id, exc_info=True)
+
+
+async def _set_status(message: discord.Message, embed: discord.Embed, text: str):
+    embed.set_footer(text=text)
+    await _safe_edit(message, embed)
+
+
+def _queue_progress_text(queue: list[dict]) -> str:
+    total_size = sum(item.get("size", 0) for item in queue)
+    total_left = sum(item.get("sizeleft", 0) for item in queue)
+    pct = round((total_size - total_left) / total_size * 100) if total_size else 0
+    seasons = sorted({
+        item["episode"]["seasonNumber"] for item in queue if item.get("episode")
+    })
+    unit = f"{len(seasons)} season(s)" if seasons else f"{len(queue)} episode(s)"
+    return f"Downloading {unit} - {pct}%"
 
 
 async def get_series_status_text(client: SonarrClient, session: aiohttp.ClientSession, series: dict) -> str:
@@ -67,14 +91,7 @@ async def get_series_status_text(client: SonarrClient, session: aiohttp.ClientSe
         queue = []
 
     if queue:
-        total_size = sum(item.get("size", 0) for item in queue)
-        total_left = sum(item.get("sizeleft", 0) for item in queue)
-        pct = round((total_size - total_left) / total_size * 100) if total_size else 0
-        seasons = sorted({
-            item["episode"]["seasonNumber"] for item in queue if item.get("episode")
-        })
-        unit = f"{len(seasons)} season(s)" if seasons else f"{len(queue)} episode(s)"
-        return f"Downloading {unit} - {pct}%"
+        return _queue_progress_text(queue)
 
     stats = series.get("statistics") or {}
     monitored = "Monitored" if series.get("monitored") else "Not monitored"
@@ -85,65 +102,83 @@ async def get_series_status_text(client: SonarrClient, session: aiohttp.ClientSe
     return f"{monitored} - no episodes tracked yet"
 
 
+async def _await_search_command(client: SonarrClient, session: aiohttp.ClientSession, command_id: int) -> str | None:
+    """Poll a Sonarr command until it finishes.
+
+    Returns the final status, or None if it could not be determined within the
+    timeout. Every exit path is bounded by the deadline - a command we can no
+    longer read is not worth polling forever, and the download it kicked off is
+    still worth tracking in the queue.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SEARCH_TIMEOUT_SECONDS
+    failures = 0
+
+    while loop.time() < deadline:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        try:
+            command = await client.get_command(session, command_id)
+        except SonarrError:
+            failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                log.warning("Gave up polling Sonarr command %s after %d failures", command_id, failures)
+                return None
+            continue
+
+        failures = 0
+        status = command.get("status")
+        if status in FINISHED_COMMAND_STATUSES:
+            return status
+
+    log.warning("Sonarr command %s did not finish within %ds", command_id, SEARCH_TIMEOUT_SECONDS)
+    return None
+
+
 async def track_download(client: SonarrClient, message: discord.Message, show: dict, embed: discord.Embed):
     series_id = show["id"]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async with aiohttp.ClientSession() as session:
         try:
             command = await client.trigger_series_search(session, series_id)
         except SonarrError:
-            embed.set_footer(text="Failed to start search - try searching from Sonarr directly")
-            await _safe_edit(message, embed)
+            log.exception("Could not start a Sonarr search for series %s", series_id)
+            await _set_status(message, embed, "Failed to start search - try searching from Sonarr directly")
             return
 
-        command_id = command["id"]
-        deadline = loop.time() + SEARCH_TIMEOUT_SECONDS
-        while True:
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
-            try:
-                command = await client.get_command(session, command_id)
-            except SonarrError:
-                continue
-            if command.get("status") in ("completed", "failed", "aborted", "cancelled"):
-                break
-            if loop.time() >= deadline:
-                embed.set_footer(text="Search is taking a while - check Sonarr for status")
-                await _safe_edit(message, embed)
-                return
-
-        if command.get("status") != "completed":
-            embed.set_footer(text="Search did not complete - check Sonarr for details")
-            await _safe_edit(message, embed)
+        status = await _await_search_command(client, session, command["id"])
+        if status in UNSUCCESSFUL_COMMAND_STATUSES:
+            await _set_status(message, embed, "Search did not complete - check Sonarr for details")
             return
 
         deadline = loop.time() + DOWNLOAD_TIMEOUT_SECONDS
         last_status = None
         ever_queued = False
+        failures = 0
+
         while loop.time() < deadline:
             try:
                 queue = await client.get_queue(session, series_id)
             except SonarrError:
-                queue = []
+                failures += 1
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    log.warning("Lost contact with Sonarr while tracking series %s", series_id)
+                    await _set_status(message, embed, "Lost contact with Sonarr - check Sonarr for status")
+                    return
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
+            failures = 0
             if queue:
                 ever_queued = True
-                total_size = sum(item.get("size", 0) for item in queue)
-                total_left = sum(item.get("sizeleft", 0) for item in queue)
-                pct = round((total_size - total_left) / total_size * 100) if total_size else 0
-                seasons = sorted({
-                    item["episode"]["seasonNumber"] for item in queue if item.get("episode")
-                })
-                unit = f"{len(seasons)} season(s)" if seasons else f"{len(queue)} episode(s)"
-                status_text = f"Downloading {unit} - {pct}%"
+                status_text = _queue_progress_text(queue)
             else:
                 try:
                     episodes = await client.get_episodes(session, series_id)
                 except SonarrError:
                     episodes = []
                 if any(ep.get("hasFile") for ep in episodes):
-                    embed.set_footer(text="Download completed")
-                    await _safe_edit(message, embed)
+                    await _set_status(message, embed, "Download completed")
                     return
                 status_text = (
                     "Waiting for a release to be grabbed..." if not ever_queued
@@ -151,17 +186,16 @@ async def track_download(client: SonarrClient, message: discord.Message, show: d
                 )
 
             if status_text != last_status:
-                embed.set_footer(text=status_text)
-                await _safe_edit(message, embed)
+                await _set_status(message, embed, status_text)
                 last_status = status_text
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-        embed.set_footer(
-            text="Still downloading - check Sonarr for live status" if ever_queued
-            else "No release grabbed within the timeout - check Sonarr for status"
+        await _set_status(
+            message, embed,
+            "Still downloading - check Sonarr for live status" if ever_queued
+            else "No release grabbed within the timeout - check Sonarr for status",
         )
-        await _safe_edit(message, embed)
 
 
 class AddOptionsView(discord.ui.View):

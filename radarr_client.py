@@ -58,7 +58,10 @@ class RadarrClient:
                 session, "/api/v3/queue",
                 movieIds=str(movie_id), page=str(page), pageSize="200",
             )
-            records.extend(data.get("records", []))
-            if len(records) >= data.get("totalRecords", len(records)):
+            batch = data.get("records", [])
+            records.extend(batch)
+            # An empty page also ends the walk: totalRecords counts unfiltered
+            # items in some Radarr versions, which a filtered walk never reaches.
+            if not batch or len(records) >= data.get("totalRecords", len(records)):
                 return records
             page += 1
