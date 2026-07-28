@@ -1,0 +1,15 @@
+# Keep secrets out of the image: the Dockerfile does `COPY . .`, and .env is
+# supplied at runtime via env_file, so a local build must never bake it in.
+.env
+
+.git
+.github
+.claude/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Stray Unraid template artifacts
+autostart
+has_build
+name
