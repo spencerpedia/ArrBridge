@@ -5,3 +5,9 @@ __pycache__/
 .DS_Store
 docker-compose.override.yml
 data/
+
+# Unraid Compose Manager writes these into the project folder
+autostart
+has_build
+name
+project_name
