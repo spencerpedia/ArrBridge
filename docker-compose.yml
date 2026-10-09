@@ -3,9 +3,13 @@ name: arrbridge
 services:
   arrbridge:
     image: ghcr.io/spencerpedia/arrbridge:latest
+    build: .
     container_name: arrbridge
     env_file: .env
     restart: unless-stopped
-    labels:
-      net.unraid.docker.icon: "/plugins/dockerMan/images/arrbridge.png"
-      net.unraid.docker.managed: "dockerman"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      # Persists in-flight download trackers so a restart resumes their embeds.
+      - ./data:/app/data

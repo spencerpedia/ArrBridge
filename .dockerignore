@@ -6,6 +6,7 @@
 .github
 .claude/
 __pycache__/
+data/
 *.pyc
 .DS_Store
 

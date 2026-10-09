@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 
 
 class SonarrError(Exception):
     pass
+
+
+# Network failures (DNS blips, refused connections, timeouts) are surfaced as
+# SonarrError too, so callers retry them like any other API error instead of the
+# exception escaping and killing whatever task made the call.
+NETWORK_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
 
 class SonarrClient:
@@ -14,17 +22,23 @@ class SonarrClient:
 
     async def _get(self, session: aiohttp.ClientSession, path: str, **params):
         url = f"{self._base_url}{path}"
-        async with session.get(url, headers=self._headers, params=params) as resp:
-            if resp.status != 200:
-                raise SonarrError(f"GET {path} failed ({resp.status}): {await resp.text()}")
-            return await resp.json()
+        try:
+            async with session.get(url, headers=self._headers, params=params) as resp:
+                if resp.status != 200:
+                    raise SonarrError(f"GET {path} failed ({resp.status}): {await resp.text()}")
+                return await resp.json()
+        except NETWORK_ERRORS as exc:
+            raise SonarrError(f"GET {path} failed: {exc!r}") from exc
 
     async def _post(self, session: aiohttp.ClientSession, path: str, json):
         url = f"{self._base_url}{path}"
-        async with session.post(url, headers=self._headers, json=json) as resp:
-            if resp.status not in (200, 201):
-                raise SonarrError(f"POST {path} failed ({resp.status}): {await resp.text()}")
-            return await resp.json()
+        try:
+            async with session.post(url, headers=self._headers, json=json) as resp:
+                if resp.status not in (200, 201):
+                    raise SonarrError(f"POST {path} failed ({resp.status}): {await resp.text()}")
+                return await resp.json()
+        except NETWORK_ERRORS as exc:
+            raise SonarrError(f"POST {path} failed: {exc!r}") from exc
 
     async def lookup_series(self, session: aiohttp.ClientSession, term: str):
         return await self._get(session, "/api/v3/series/lookup", term=term)

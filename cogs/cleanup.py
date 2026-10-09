@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ log = logging.getLogger("arrbridge")
 CLEANUP_CHANNEL_ID = int(os.environ["CLEANUP_CHANNEL_ID"])
 CLEANUP_MAX_AGE_HOURS = float(os.environ.get("CLEANUP_MAX_AGE_HOURS", "6"))
 CLEANUP_INTERVAL_MINUTES = 30
+RESTART_DELAY_SECONDS = 60
 
 # purge() walks the channel history and deletes what it finds. Without
 # read_message_history Discord hands back an empty history instead of an error,
@@ -85,8 +87,12 @@ class Cleanup(commands.Cog):
     @cleanup_loop.error
     async def cleanup_loop_error(self, exc: BaseException):
         # An unhandled error stops a tasks.loop permanently, which is how this
-        # sweep can go missing without anything in the log saying so.
-        log.error("Cleanup loop crashed - restarting it", exc_info=exc)
+        # sweep can go missing without anything in the log saying so. Network
+        # errors (DNS blips, dropped connections) never get here - tasks.loop
+        # already retries those with backoff - so this is something unexpected;
+        # pause first so a persistent failure doesn't restart in a tight loop.
+        log.error("Cleanup loop crashed - restarting in %ds", RESTART_DELAY_SECONDS, exc_info=exc)
+        await asyncio.sleep(RESTART_DELAY_SECONDS)
         self.cleanup_loop.restart()
 
 

@@ -3,15 +3,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+import pending_store
 from radarr_client import RadarrClient, RadarrError
 
 log = logging.getLogger("arrbridge")
+
+PENDING_KIND = "movie"
 
 RADARR_URL = os.environ["RADARR_URL"]
 RADARR_API_KEY = os.environ["RADARR_API_KEY"]
@@ -128,10 +132,44 @@ async def _await_search_command(client: RadarrClient, session: aiohttp.ClientSes
     return None
 
 
-async def track_download(client: RadarrClient, message: discord.Message, movie: dict, embed: discord.Embed):
-    movie_id = movie["id"]
-    loop = asyncio.get_running_loop()
+def _spawn(coro):
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
+
+async def _run_tracker(message: discord.Message, embed: discord.Embed, tracker):
+    """Run a tracking coroutine, dropping its pending entry once it's finished."""
+    try:
+        await tracker
+    except asyncio.CancelledError:
+        # The bot is shutting down - keep the entry so the next start resumes it.
+        raise
+    except Exception:
+        log.exception("Download tracking for message %s crashed", message.id)
+        await _set_status(message, embed, "Tracking stopped unexpectedly - check Radarr for status")
+    pending_store.remove(PENDING_KIND, message.id)
+
+
+async def track_download(client: RadarrClient, message: discord.Message, movie: dict, embed: discord.Embed):
+    pending_store.add(PENDING_KIND, message.id, message.channel.id, movie["id"], embed.footer.text)
+    await _run_tracker(message, embed, _search_and_track(client, message, movie["id"], embed))
+
+
+async def resume_download(client: RadarrClient, message: discord.Message, embed: discord.Embed, entry: dict):
+    # No deadline means the restart hit during the search phase; Radarr carries
+    # on with the search regardless, so just start watching the queue afresh.
+    # Either way, check at least once so a finished download still shows as done.
+    deadline = entry.get("deadline") or time.time() + DOWNLOAD_TIMEOUT_SECONDS
+    deadline = max(deadline, time.time() + POLL_INTERVAL_SECONDS)
+    tracker = _track_queue(
+        client, message, entry["item_id"], embed, deadline,
+        ever_queued=entry.get("ever_queued", False), last_status=entry.get("status"),
+    )
+    await _run_tracker(message, embed, tracker)
+
+
+async def _search_and_track(client: RadarrClient, message: discord.Message, movie_id: int, embed: discord.Embed):
     async with aiohttp.ClientSession() as session:
         try:
             command = await client.trigger_movie_search(session, movie_id)
@@ -145,12 +183,18 @@ async def track_download(client: RadarrClient, message: discord.Message, movie: 
             await _set_status(message, embed, "Search did not complete - check Radarr for details")
             return
 
-        deadline = loop.time() + DOWNLOAD_TIMEOUT_SECONDS
-        last_status = None
-        ever_queued = False
+    # Wall-clock rather than loop.time() so the deadline survives a restart.
+    deadline = time.time() + DOWNLOAD_TIMEOUT_SECONDS
+    pending_store.update(PENDING_KIND, message.id, deadline=deadline)
+    await _track_queue(client, message, movie_id, embed, deadline)
+
+
+async def _track_queue(client: RadarrClient, message: discord.Message, movie_id: int, embed: discord.Embed,
+                       deadline: float, ever_queued: bool = False, last_status: str | None = None):
+    async with aiohttp.ClientSession() as session:
         failures = 0
 
-        while loop.time() < deadline:
+        while time.time() < deadline:
             try:
                 queue = await client.get_queue(session, movie_id)
             except RadarrError:
@@ -182,6 +226,7 @@ async def track_download(client: RadarrClient, message: discord.Message, movie: 
             if status_text != last_status:
                 await _set_status(message, embed, status_text)
                 last_status = status_text
+                pending_store.update(PENDING_KIND, message.id, status=status_text, ever_queued=ever_queued)
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
@@ -263,9 +308,7 @@ class AddMovieOptionsView(discord.ui.View):
         embed = build_movie_embed(created, status="Searching for a release...")
         await interaction.response.edit_message(content=None, embed=embed, view=None)
 
-        task = asyncio.create_task(track_download(self.client, interaction.message, created, embed))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        _spawn(track_download(self.client, interaction.message, created, embed))
 
 
 class MoviePicker(discord.ui.View):
@@ -360,6 +403,36 @@ class AddMovie(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.client = RadarrClient(RADARR_URL, RADARR_API_KEY)
+        self._resumed = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # on_ready fires again after every gateway reconnect; only resume once.
+        if self._resumed:
+            return
+        self._resumed = True
+        for entry in pending_store.pending(PENDING_KIND):
+            await self._resume(entry)
+
+    async def _resume(self, entry: dict):
+        message_id = entry["message_id"]
+        try:
+            channel = self.bot.get_channel(entry["channel_id"]) or await self.bot.fetch_channel(entry["channel_id"])
+            message = await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden):
+            log.info("Dropping pending tracker for message %s - it was deleted or is unreachable", message_id)
+            pending_store.remove(PENDING_KIND, message_id)
+            return
+        except (discord.HTTPException, aiohttp.ClientError):
+            log.warning("Could not fetch message %s to resume tracking - will retry next start", message_id, exc_info=True)
+            return
+
+        if not message.embeds:
+            pending_store.remove(PENDING_KIND, message_id)
+            return
+
+        log.info("Resuming download tracking for movie %s (message %s)", entry["item_id"], message_id)
+        _spawn(resume_download(self.client, message, message.embeds[0], entry))
 
     @app_commands.command(name="addmovie", description="Search Radarr and add a movie to download.")
     @app_commands.describe(query="Movie title to search for")

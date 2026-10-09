@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# Official Docker Hub image via AWS's public mirror: Docker Hub rate-limits
+# anonymous pulls from shared CI runners (429 Too Many Requests).
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
 

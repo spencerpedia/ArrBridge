@@ -38,12 +38,42 @@ so that channel never builds up history. This is not tied to a command.
    the channel in Discord with Developer Mode on → Copy Channel ID).  `GUILD_ID` is
    optional — set it to your server's ID while testing so slash commands register
    instantly instead of waiting up to an hour.
-4. Run it:
+4. Run it from the repo directory (where `docker-compose.yml` and `.env` live):
 
    ```
+   # Use the prebuilt image from GHCR (rebuilt on every push to main)
+   docker compose up -d
+
+   # ...or build the image yourself from this source tree
    docker compose up -d --build
    ```
 
-`SONARR_URL`/`RADARR_URL` must be reachable from the bot container — use the NAS's
+   To update the prebuilt image later: `docker compose pull && docker compose up -d`.
+
+`SONARR_URL`/`RADARR_URL` must be reachable from the bot container — use the host's
 LAN IP (e.g. `http://192.168.1.10:8989`) unless Sonarr/Radarr and this bot share a
 Docker network.
+
+`.env` is read at runtime via `env_file` and is never baked into the image:
+`.dockerignore` excludes it (along with `.git`, `.claude/` and `__pycache__/`) from
+local builds, so building from source won't leak your tokens into an image.
+
+Download progress embeds that are still updating when the bot restarts are recorded
+in `data/pending.json` (mounted from `./data` on the host) and pick up where they
+left off once the bot reconnects.
+
+Host-specific settings (Unraid labels, extra networks, etc.) belong in a
+`docker-compose.override.yml`, which Compose merges automatically and git ignores.
+
+## Troubleshooting
+
+- **Bot restarts repeatedly / `Cannot connect to host discord.com` / `Temporary failure
+  in name resolution`** — the container can't resolve DNS. `docker-compose.yml` pins
+  `dns: [1.1.1.1, 8.8.8.8]` for this reason; if your network blocks public DNS,
+  replace those with your router's or local resolver's IP. Note that public resolvers
+  can't resolve local hostnames, so use IPs (not `sonarr.lan`) in `SONARR_URL`/`RADARR_URL`.
+- **Slash commands don't appear** — set `GUILD_ID` for instant sync; global sync can
+  take up to an hour.
+- **Channel cleanup deletes nothing** — the bot needs View Channel, Read Message
+  History and Manage Messages in that channel; the log names whichever is missing.
+- Check logs with `docker compose logs -f arrbridge`.
